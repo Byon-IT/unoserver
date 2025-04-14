@@ -1,73 +1,85 @@
 from __future__ import annotations
 
+import sys
+
+from exceptions import UnoServerException
+
+sys.path.append("/usr/lib/python3/dist-packages")
+sys.path.append("/usr/lib/libreoffice/program")
+
 import argparse
 import logging
 import os
 import shutil
 import signal
-import socket
 import subprocess
-import sys
 import tempfile
 import threading
 import time
 import platform
-import xmlrpc.server
-from importlib import metadata
 from pathlib import Path
+from flask import Flask, request, jsonify
+import base64
 
-from concurrent import futures
-
-from unoserver import converter, comparer
+from unoserver import converter
 from com.sun.star.uno import Exception as UnoException
 
 API_VERSION = "3"
-__version__ = metadata.version("unoserver")
+__version__ = "Byon"
 logger = logging.getLogger("unoserver")
-
-
-class XMLRPCServer(xmlrpc.server.SimpleXMLRPCServer):
-    def __init__(
-        self,
-        addr: tuple[str, int],
-        allow_none: bool = False,
-    ) -> None:
-        addr_info = socket.getaddrinfo(addr[0], addr[1], proto=socket.IPPROTO_TCP)
-
-        if len(addr_info) == 0:
-            raise RuntimeError(
-                f"Could not get interface information for {addr[0]}:{addr[1]}"
-            )
-
-        self.address_family = addr_info[0][0]
-        self.socket_type = addr_info[0][1]
-        super().__init__(addr=addr_info[0][4], allow_none=allow_none)
 
 
 class UnoServer:
     def __init__(
         self,
-        interface="127.0.0.1",
-        port="2003",
         uno_interface="127.0.0.1",
         uno_port="2002",
         user_installation=None,
         conversion_timeout=None,
         stop_after=None,
+        executable="libreoffice",
     ):
-        self.interface = interface
         self.uno_interface = uno_interface
-        self.port = port
         self.uno_port = uno_port
         self.user_installation = user_installation
         self.conversion_timeout = conversion_timeout
         self.stop_after = stop_after
         self.libreoffice_process = None
-        self.xmlrcp_thread = None
-        self.xmlrcp_server = None
         self.intentional_exit = False
+        self.converter_instance = None
+        self._libreoffice_lock = threading.Lock()
+        self.is_libreoffice_started = False
+        self.is_server_stopped = True
+        self.heartbeat_thread : threading.Thread = None
+        self.executable = executable
+
+        signal.signal(signal.SIGTERM, self.signal_handler)
+        signal.signal(signal.SIGINT, self.signal_handler)
+        # Signal SIGHUP is available only in Unix systems
+        if platform.system() != "Windows":
+            signal.signal(signal.SIGHUP, self.signal_handler)
+
 
     def start(self, executable="libreoffice"):
+        self.start_libreoffice(executable)
+        self.start_unoconverter()
+        self.is_libreoffice_started = True
+        self.is_server_stopped = False
+        self.heartbeat_thread = threading.Thread(target=self.heartbeat)
+        self.heartbeat_thread.start()
+
+    def signal_handler(self, signum, frame):
+        self.intentional_exit = True
+        logger.info("Sending signal to LibreOffice")
+        try:
+            if self.is_libreoffice_started:
+                self.libreoffice_process.send_signal(signum)
+        except ProcessLookupError as e:
+            # 3 means the process is already dead
+            if e.errno != 3:
+                raise
+
+    def start_libreoffice(self, executable="libreoffice"):
         logger.info(f"Starting unoserver {__version__}.")
 
         connection = (
@@ -92,237 +104,91 @@ class UnoServer:
 
         logger.info("Command: " + " ".join(cmd))
         self.libreoffice_process = subprocess.Popen(cmd)
-        self.xmlrcp_thread = threading.Thread(None, self.serve)
-
-        def signal_handler(signum, frame):
-            self.intentional_exit = True
-            logger.info("Sending signal to LibreOffice")
-            try:
-                self.libreoffice_process.send_signal(signum)
-            except ProcessLookupError as e:
-                # 3 means the process is already dead
-                if e.errno != 3:
-                    raise
-
-            if self.xmlrcp_server is not None:
-                self.stop()  # Ensure the server stops
-
-        signal.signal(signal.SIGTERM, signal_handler)
-        signal.signal(signal.SIGINT, signal_handler)
-
-        # Signal SIGHUP is available only in Unix systems
-        if platform.system() != "Windows":
-            signal.signal(signal.SIGHUP, signal_handler)
 
         time.sleep(5)
 
-        self.xmlrcp_thread.start()
-
-        # Give the thread time to start
-        time.sleep(2)
-        # Check if it succeeded
-        if not self.xmlrcp_thread.is_alive():
-            logger.info("Failed to start servers")
-            self.stop()
-            return None
-
         return self.libreoffice_process
 
-    def serve(self):
-        # Create server
-        with XMLRPCServer((self.interface, int(self.port)), allow_none=True) as server:
-            logger.info("Starting UnoConverter.")
-            attempts = 20
-            while attempts > 0:
-                try:
-                    self.conv = converter.UnoConverter(
-                        interface=self.uno_interface, port=self.uno_port
-                    )
-                    break
-                except UnoException as e:
-                    # A connection refused just means it hasn't started yet:
-                    if "Connection refused" in str(e):
-                        logger.debug("Libreoffice is not yet started")
-                        time.sleep(2)
-                        attempts -= 1
-                        continue
-                    # This is a different error
-                    logger.warning("Error when starting UnoConverter, retrying: %s", e)
-                    # These kinds of errors can be retried fewer times
-                    attempts -= 4
-                    time.sleep(5)
-                    continue
-            else:
-                # We ran out of attempts
-                logger.critical("Could not start Libreoffice, exiting.")
-                # Make sure it's really dead
-                self.libreoffice_process.terminate()
-                return
-
-            logger.info("Starting UnoComparer.")
-            attempts = 20
-            while attempts > 0:
-                try:
-                    self.comp = comparer.UnoComparer(
-                        interface=self.uno_interface, port=self.uno_port
-                    )
-                    break
-                except UnoException as e:
-                    # A connection refused just means it hasn't started yet:
-                    if "Connection refused" in str(e):
-                        logger.debug("Libreoffice is not yet started")
-                        attempts -= 1
-                        time.sleep(2)
-                        continue
-                    # This is a different error
-                    logger.warning("Error when starting UnoConverter, retrying: %s", e)
-                    # These kinds of errors can be retried fewer times
-                    attempts -= 4
-                    time.sleep(5)
-                    continue
-            else:
-                # We ran out of attempts
-                logger.critical("Could not start Libreoffice, exiting.")
-                # Make sure it's really dead
-                self.libreoffice_process.terminate()
-                return
-
-            self.xmlrcp_server = server
-            server.register_introspection_functions()
-
-            self.number_of_requests = 0
-
-            def stop_after():
-                if self.stop_after is None:
-                    return
-                self.number_of_requests += 1
-                if self.number_of_requests == self.stop_after:
-                    logger.info(
-                        "Processed %d requests, exiting.",
-                        self.stop_after,
-                    )
-                    self.intentional_exit = True
-                    self.libreoffice_process.terminate()
-
-            @server.register_function
-            def info():
-                import_filters = self.conv.get_filter_names(
-                    self.conv.get_available_import_filters()
-                )
-                export_filters = self.conv.get_filter_names(
-                    self.conv.get_available_export_filters()
-                )
-                return {
-                    "unoserver": __version__,
-                    "api": API_VERSION,
-                    "import_filters": import_filters,
-                    "export_filters": export_filters,
-                }
-
-            @server.register_function
-            def convert(
-                inpath=None,
-                indata=None,
-                outpath=None,
-                convert_to=None,
-                filtername=None,
-                filter_options=[],
-                update_index=True,
-                infiltername=None,
-            ):
-                if indata is not None:
-                    indata = indata.data
-
-                with futures.ThreadPoolExecutor() as executor:
-                    future = executor.submit(
-                        self.conv.convert,
-                        inpath,
-                        indata,
-                        outpath,
-                        convert_to,
-                        filtername,
-                        filter_options,
-                        update_index,
-                        infiltername,
-                    )
-                    try:
-                        result = future.result(timeout=self.conversion_timeout)
-                    except futures.TimeoutError:
-                        logger.error(
-                            "Conversion timeout, terminating conversion and exiting."
-                        )
-                        self.conv.local_context.dispose()
-                        self.libreoffice_process.terminate()
-                        raise
-                    else:
-                        stop_after()
-                        return result
-
-            @server.register_function
-            def compare(
-                oldpath=None,
-                olddata=None,
-                newpath=None,
-                newdata=None,
-                outpath=None,
-                filetype=None,
-            ):
-                if olddata is not None:
-                    olddata = olddata.data
-                if newdata is not None:
-                    newdata = newdata.data
-
-                with futures.ThreadPoolExecutor() as executor:
-                    future = executor.submit(
-                        self.comp.compare,
-                        oldpath,
-                        olddata,
-                        newpath,
-                        newdata,
-                        outpath,
-                        filetype,
-                    )
-                try:
-                    result = future.result(timeout=self.conversion_timeout)
-                except futures.TimeoutError:
-                    logger.error(
-                        "Comparison timeout, terminating conversion and exiting."
-                    )
-                    self.conv.local_context.dispose()
-                    self.libreoffice_process.terminate()
-                    raise
-                else:
-                    stop_after()
-                    return result
-
-            logger.info("Started.")
-            server.serve_forever()
-
-    def stop(self):
-
-        if self.xmlrcp_server is not None:
-            self.xmlrcp_server.shutdown()
-            # Make a dummy connection to unblock accept() - otherwise it will
-            # hang indefinitely in the accept() call.
-            # noinspection PyBroadException
+    def start_unoconverter(self):
+        logger.info(f"Starting UnoConverter instance.")
+        attempts = 20
+        while attempts > 0:
             try:
-                with socket.create_connection(
-                    (self.interface, int(self.port)), timeout=1
-                ):
-                    pass
-            except Exception:
-                pass  # Ignore any except
+                self.converter_instance = converter.UnoConverter(
+                    interface=self.uno_interface, port=self.uno_port
+                )
+                break
+            except UnoException as e:
+                # A connection refused just means it hasn't started yet:
+                if "Connection refused" in str(e):
+                    logger.debug("Libreoffice is not yet started")
+                    time.sleep(2)
+                    attempts -= 1
+                    continue
+                # This is a different error
+                logger.warning("Error when starting UnoConverter, retrying: %s", e)
+                # These kinds of errors can be retried fewer times
+                attempts -= 4
+                time.sleep(5)
+                continue
+        else:
+            # We ran out of attempts
+            logger.critical("Could not start Libreoffice, exiting.")
+            # Make sure it's really dead
+            self.libreoffice_process.terminate()
+            raise UnoServerException("Could not start Libreoffice, exiting.")
 
-        if self.xmlrcp_thread is not None:
-            self.xmlrcp_thread.join()
+        logger.info("UnoConverter started")
 
-        if self.libreoffice_process and self.libreoffice_process.poll() is not None:
+    def kill_libreoffice(self):
+        if self.libreoffice_process is not None:
+            logger.info("Sending SIGTERM to libreoffice")
             self.libreoffice_process.terminate()
             try:
-                self.libreoffice_process.wait(10)
+                self.libreoffice_process.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                logger.info("Signalling harder...")
-                self.libreoffice_process.terminate()
+                logger.info("Sending SIGKILL to libreoffice")
+                self.libreoffice_process.kill()
+            self.is_libreoffice_started = False
+
+    def test_convert(self, document_name):
+        if not self.is_libreoffice_started:
+            self.start()
+
+        try:
+            with self._libreoffice_lock:
+                with open(f"/opt/project/tests/documents/{document_name}", "rb") as fo:
+                    data = fo.read()
+                if os.path.exists("/opt/project/tests/documents/out.pdf"):
+                    os.unlink("/opt/project/tests/documents/out.pdf")
+                self.converter_instance.convert(indata=data, outpath="/opt/project/tests/documents/out.pdf")
+        except:
+            logger.exception("Conversion failed")
+
+    def convert_to_pdf(self, filename: str, file_content: bytes) -> bytes:
+        if not self.is_libreoffice_started:
+            self.start()
+
+        try:
+            with self._libreoffice_lock:
+                return self.converter_instance.convert(indata=file_content, convert_to="pdf")
+        except:
+            logger.exception("Conversion failed")
+
+    def heartbeat(self):
+        while not self.is_server_stopped:
+            is_acquired = self._libreoffice_lock.acquire(timeout=self.conversion_timeout)
+            if not is_acquired:
+                logger.info("Heartbeat failed, killing libreoffice")
+                self.kill_libreoffice()
+                self.is_server_stopped = True
+            else:
+                self._libreoffice_lock.release()
+                time.sleep(5)
+
+    def serve(self):
+        self.heartbeat()
+
 
 
 def main():
@@ -330,13 +196,7 @@ def main():
     logger.setLevel(logging.INFO)
 
     parser = argparse.ArgumentParser("unoserver")
-    parser.add_argument(
-        "-v",
-        "--version",
-        action="version",
-        help="Display version and exit.",
-        version=f"{parser.prog} {__version__}",
-    )
+
     parser.add_argument(
         "--interface",
         default="127.0.0.1",
@@ -355,131 +215,54 @@ def main():
     )
     parser.add_argument("--daemon", action="store_true", help="Deamonize the server")
     parser.add_argument(
-        "--executable",
-        default=None,
-        help="The path to the LibreOffice executable, defaults to looking in the path",
-    )
-    parser.add_argument(
-        "--user-installation",
-        default=None,
-        help="The path to the LibreOffice user profile",
-    )
-    parser.add_argument(
-        "--libreoffice-pid-file",
-        "-p",
-        default=None,
-        help="If set, unoserver will write the Libreoffice PID to this file. If started "
-        "in daemon mode, the file will not be deleted when unoserver exits.",
-    )
-    parser.add_argument(
         "--conversion-timeout",
         type=int,
         help="Terminate Libreoffice and exit if a conversion does not complete in the "
         "given time (in seconds).",
-    )
-    parser.add_argument(
-        "--stop-after",
-        type=int,
-        help="Terminate Libreoffice and exit after the given number of requests.",
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        dest="verbose",
-        help="Increase informational output to stderr.",
-    )
-    parser.add_argument(
-        "--quiet",
-        action="store_true",
-        dest="quiet",
-        help="Decrease informational output to stderr.",
+        default=30
     )
     args = parser.parse_args()
 
-    if args.verbose:
-        logger.setLevel(logging.DEBUG)
-    elif args.quiet:
-        logger.setLevel(logging.CRITICAL)
-    else:
-        logger.setLevel(logging.INFO)
-    if args.verbose and args.quiet:
-        logger.debug("Make up your mind, yo!")
-
-    if args.daemon:
-        cmd = sys.argv
-        cmd.remove("--daemon")
-        proc = subprocess.Popen(cmd)
-        return proc.pid
+    logger.setLevel(logging.DEBUG)
 
     with tempfile.TemporaryDirectory() as tmpuserdir:
         user_installation = Path(tmpuserdir).as_uri()
 
-        if args.user_installation is not None:
-            user_installation = Path(args.user_installation).as_uri()
-
-        if args.uno_port == args.port:
-            raise RuntimeError("--port and --uno-port must be different")
+        for name in ("soffice", "libreoffice", "ooffice"):
+            if (executable := shutil.which(name)) is not None:
+                break
 
         server = UnoServer(
-            args.interface,
-            args.port,
             args.uno_interface,
             args.uno_port,
             user_installation,
             args.conversion_timeout,
-            args.stop_after,
+            executable=executable
         )
 
-        if args.executable is not None:
-            executable = args.executable
-        else:
-            # Find the executable automatically. I had problems with
-            # LibreOffice using 100% if started with the libreoffice
-            # executable, so by default try soffice first. Also throwing
-            # ooffice in there as a fallback, I don't think it's used any
-            # more, but it doesn't hurt to have it there.
-            for name in ("soffice", "libreoffice", "ooffice"):
-                if (executable := shutil.which(name)) is not None:
-                    break
+        app = Flask(__name__)
 
-        # If it's daemonized, this returns the process.
-        # It returns 0 of getting killed in a normal way.
-        # Otherwise it returns 1 after the process exits.
-        process = server.start(executable=executable)
-        if process is None:
-            return 2
-        pid = process.pid
+        @app.route('/convert-to-pdf', methods=['POST'])
+        def convert_to_pdf_endpoint():
+            data = request.get_json()
 
-        logger.info(f"Server PID: {pid}")
+            if not data or 'filename' not in data or 'file-content' not in data:
+                return jsonify({'error': 'Missing filename or file-content'}), 400
 
-        if args.libreoffice_pid_file:
-            with open(args.libreoffice_pid_file, "wt") as upf:
-                upf.write(f"{pid}")
+            filename = data['filename']
+            try:
+                file_bytes = base64.b64decode(data['file-content'])
+            except Exception as e:
+                return jsonify({'error': 'Invalid base64 content'}), 400
 
-        process.wait()
+            pdf_bytes = server.convert_to_pdf(filename, file_bytes)
+            pdf_base64 = base64.b64encode(pdf_bytes).decode('utf-8')
 
-        if not server.intentional_exit:
-            logger.error(f"Looks like LibreOffice died. PID: {pid}")
+            return jsonify({
+                'pdfcontent': pdf_base64
+            })
 
-        # The RPC thread needs to be stopped before the process can exit
-        server.stop()
-        if args.libreoffice_pid_file:
-            # Remove the PID file
-            os.unlink(args.libreoffice_pid_file)
-
-        try:
-            # Make sure it's really dead
-            os.kill(pid, 0)
-
-            if server.intentional_exit:
-                return 0
-            else:
-                return 1
-        except OSError as e:
-            if e.errno == 3:
-                # All good, it was already dead.
-                return 0
-            raise
+        app.run(host="0.0.0.0", debug=True)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,3 @@
+class UnoServerException(Exception):
+    pass
+
