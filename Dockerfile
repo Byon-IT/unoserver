@@ -13,10 +13,13 @@ RUN apt-get install -y unoconv
 
 RUN python3 -m pip config set global.break-system-packages true
 
-ADD requirements.txt /tmp/requirements.txt
+COPY requirements.txt /tmp/requirements.txt
 RUN pip3 install -r /tmp/requirements.txt
+RUN rm /tmp/requirements.txt
+
+COPY src/ /opt/libreoffice-converter/
 
 ARG CACHEBUST=1
 
-
-CMD ["python3", "--version"]
+WORKDIR /opt/libreoffice-converter/
+CMD ["python3", "/opt/libreoffice-converter/rest_server.py"]

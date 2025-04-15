@@ -2,30 +2,30 @@ from __future__ import annotations
 
 import sys
 
-from exceptions import UnoServerException
 
 sys.path.append("/usr/lib/python3/dist-packages")
 sys.path.append("/usr/lib/libreoffice/program")
 
-import argparse
 import logging
 import os
 import shutil
+import psutil
 import signal
 import subprocess
-import tempfile
 import threading
 import time
 import platform
-from pathlib import Path
-from flask import Flask, request, jsonify
-import base64
+
 
 from unoserver import converter
+from unoserver.exceptions import UnoServerException
+
 from com.sun.star.uno import Exception as UnoException
 
 API_VERSION = "3"
 __version__ = "Byon"
+
+
 logger = logging.getLogger("unoserver")
 
 
@@ -36,22 +36,31 @@ class UnoServer:
         uno_port="2002",
         user_installation=None,
         conversion_timeout=None,
-        stop_after=None,
-        executable="libreoffice",
+        memory_usage_ratio_limit=6.0,
     ):
         self.uno_interface = uno_interface
         self.uno_port = uno_port
         self.user_installation = user_installation
         self.conversion_timeout = conversion_timeout
-        self.stop_after = stop_after
         self.libreoffice_process = None
         self.intentional_exit = False
         self.converter_instance = None
+        self._start_lock = threading.Lock()
         self._libreoffice_lock = threading.Lock()
+        self._libreoffice_initial_ram_usage = 0
         self.is_libreoffice_started = False
         self.is_server_stopped = True
-        self.heartbeat_thread : threading.Thread = None
-        self.executable = executable
+        self.heartbeat_thread: threading.Thread = None
+
+        self.executable = None
+        for name in ("soffice", "libreoffice", "ooffice"):
+            if (executable := shutil.which(name)) is not None:
+                break
+
+        if not executable:
+            raise UnoServerException("Could not find libreoffice executable")
+        else:
+            self.executable = executable
 
         signal.signal(signal.SIGTERM, self.signal_handler)
         signal.signal(signal.SIGINT, self.signal_handler)
@@ -59,14 +68,28 @@ class UnoServer:
         if platform.system() != "Windows":
             signal.signal(signal.SIGHUP, self.signal_handler)
 
+        # The memory usage ratio limit makes sure that if the libreoffice process exceeds
+        # its initial memory usage by that multiplier it will be killed.
+        if memory_usage_ratio_limit <= 1.0:
+            raise ValueError("The memory usage ratio limit cannot be 1.0 or less")
+        self.memory_usage_ratio_limit = memory_usage_ratio_limit
 
     def start(self, executable="libreoffice"):
-        self.start_libreoffice(executable)
-        self.start_unoconverter()
-        self.is_libreoffice_started = True
-        self.is_server_stopped = False
-        self.heartbeat_thread = threading.Thread(target=self.heartbeat)
-        self.heartbeat_thread.start()
+        with self._start_lock:
+            if not self.is_server_stopped:
+                logger.debug("The UnoServer is already started")
+                return
+
+            self.start_libreoffice(executable)
+            self.start_unoconverter()
+            self.is_server_stopped = False
+
+            self._libreoffice_initial_ram_usage = self.get_libreoffice_ram_usage()
+            logger.info(f"Initial Libreoffice RAM usage: {int(self._libreoffice_initial_ram_usage / (1024**2))}mb")
+
+            if not self.heartbeat_thread or not self.heartbeat_thread.is_alive():
+                self.heartbeat_thread = threading.Thread(target=self.heartbeat)
+                self.heartbeat_thread.start()
 
     def signal_handler(self, signum, frame):
         self.intentional_exit = True
@@ -74,12 +97,19 @@ class UnoServer:
         try:
             if self.is_libreoffice_started:
                 self.libreoffice_process.send_signal(signum)
+                self.is_libreoffice_started = False
+                self.is_server_stopped = True
         except ProcessLookupError as e:
             # 3 means the process is already dead
             if e.errno != 3:
                 raise
+        exit()
 
     def start_libreoffice(self, executable="libreoffice"):
+        if self.is_libreoffice_started:
+            logger.debug("Libreoffice is already started")
+            return
+
         logger.info(f"Starting unoserver {__version__}.")
 
         connection = (
@@ -104,10 +134,27 @@ class UnoServer:
 
         logger.info("Command: " + " ".join(cmd))
         self.libreoffice_process = subprocess.Popen(cmd)
-
         time.sleep(5)
+        self.is_libreoffice_started = True
 
         return self.libreoffice_process
+
+    def get_libreoffice_ram_usage(self):
+        if not self.is_libreoffice_started:
+            raise RuntimeError("Cannot check memory of unstarted process")
+        libreoffice_pid = self.libreoffice_process.pid
+
+        parent = psutil.Process(libreoffice_pid)
+        children = parent.children(recursive=True)
+
+        total_rss = parent.memory_info().rss  # bytes
+        for child in children:
+            try:
+                total_rss += child.memory_info().rss
+            except psutil.NoSuchProcess:
+                continue  # Child exited during iteration?
+
+        return total_rss
 
     def start_unoconverter(self):
         logger.info(f"Starting UnoConverter instance.")
@@ -176,6 +223,7 @@ class UnoServer:
             logger.exception("Conversion failed")
 
     def heartbeat(self):
+        logger.debug(f"Heartbeat thread #{threading.get_ident()} started")
         while not self.is_server_stopped:
             is_acquired = self._libreoffice_lock.acquire(timeout=self.conversion_timeout)
             if not is_acquired:
@@ -183,87 +231,12 @@ class UnoServer:
                 self.kill_libreoffice()
                 self.is_server_stopped = True
             else:
+                memory_usage_threshold = self._libreoffice_initial_ram_usage * self.memory_usage_ratio_limit
+                if self.get_libreoffice_ram_usage() > memory_usage_threshold:
+                    memory_usage_threshold_mb = int(memory_usage_threshold / (1024 ** 2))
+                    logger.info(f"Libreoffice uses more than {memory_usage_threshold_mb}mb of RAM, killing it.")
+                    self.kill_libreoffice()
+                    self.is_server_stopped = True
+
                 self._libreoffice_lock.release()
                 time.sleep(5)
-
-    def serve(self):
-        self.heartbeat()
-
-
-
-def main():
-    logging.basicConfig()
-    logger.setLevel(logging.INFO)
-
-    parser = argparse.ArgumentParser("unoserver")
-
-    parser.add_argument(
-        "--interface",
-        default="127.0.0.1",
-        help="The interface used by the XMLRPC server",
-    )
-    parser.add_argument(
-        "--uno-interface",
-        default="127.0.0.1",
-        help="The interface used by the Libreoffice UNO server",
-    )
-    parser.add_argument(
-        "--port", default="2003", help="The port used by the XMLRPC server"
-    )
-    parser.add_argument(
-        "--uno-port", default="2002", help="The port used by the Libreoffice UNO server"
-    )
-    parser.add_argument("--daemon", action="store_true", help="Deamonize the server")
-    parser.add_argument(
-        "--conversion-timeout",
-        type=int,
-        help="Terminate Libreoffice and exit if a conversion does not complete in the "
-        "given time (in seconds).",
-        default=30
-    )
-    args = parser.parse_args()
-
-    logger.setLevel(logging.DEBUG)
-
-    with tempfile.TemporaryDirectory() as tmpuserdir:
-        user_installation = Path(tmpuserdir).as_uri()
-
-        for name in ("soffice", "libreoffice", "ooffice"):
-            if (executable := shutil.which(name)) is not None:
-                break
-
-        server = UnoServer(
-            args.uno_interface,
-            args.uno_port,
-            user_installation,
-            args.conversion_timeout,
-            executable=executable
-        )
-
-        app = Flask(__name__)
-
-        @app.route('/convert-to-pdf', methods=['POST'])
-        def convert_to_pdf_endpoint():
-            data = request.get_json()
-
-            if not data or 'filename' not in data or 'file-content' not in data:
-                return jsonify({'error': 'Missing filename or file-content'}), 400
-
-            filename = data['filename']
-            try:
-                file_bytes = base64.b64decode(data['file-content'])
-            except Exception as e:
-                return jsonify({'error': 'Invalid base64 content'}), 400
-
-            pdf_bytes = server.convert_to_pdf(filename, file_bytes)
-            pdf_base64 = base64.b64encode(pdf_bytes).decode('utf-8')
-
-            return jsonify({
-                'pdfcontent': pdf_base64
-            })
-
-        app.run(host="0.0.0.0", debug=True)
-
-
-if __name__ == "__main__":
-    main()

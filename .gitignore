@@ -131,3 +131,4 @@ dmypy.json
 #ide
 .idea/
 *.code-workspace
+/tests/documents/converted_document.pdf
