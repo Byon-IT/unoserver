@@ -16,7 +16,7 @@ logger.setLevel(logging.DEBUG)
 LISTEN_INTERFACE = os.environ.get('LISTEN_INTERFACE', '0.0.0.0')
 LISTEN_PORT = int(os.environ.get('LISTEN_PORT', '5000'))
 CONVERSION_TIMEOUT = int(os.environ.get('CONVERSION_TIMEOUT', '30'))
-MEMORY_USAGE_RATIO_LIMIT = float(os.environ.get('MEMORY_USAGE_RATIO_LIMIT', '6.0'))
+MEMORY_USAGE_RATIO_LIMIT = float(os.environ.get('MEMORY_USAGE_RATIO_LIMIT', '5.0'))
 
 
 def main():
@@ -54,7 +54,7 @@ def main():
             })
 
         @app.route('/heartbeat', methods=['GET'])
-        def convert_to_pdf_endpoint():
+        def heartbeat():
             if libreoffice_server.is_server_stopped:
                 return jsonify({'success': False, 'details': 'Server is stopped'}), 500
             else:
