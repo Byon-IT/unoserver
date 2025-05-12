@@ -35,23 +35,19 @@ def main():
 
         @app.route('/convert-to-pdf', methods=['POST'])
         def convert_to_pdf_endpoint():
-            data = request.get_json()
+            uploaded_file = request.files.get('file')
 
-            if not data or 'filename' not in data or 'file-content' not in data:
-                return jsonify({'error': 'Missing filename or file-content'}), 400
+            if not uploaded_file:
+                return jsonify({'error': 'Missing file'}), 400
 
-            filename = data['filename']
             try:
-                file_bytes = base64.b64decode(data['file-content'])
+                file_bytes = uploaded_file.read()
+                pdf_bytes = libreoffice_server.convert_to_pdf(file_bytes)
+                pdf_base64 = base64.b64encode(pdf_bytes).decode('utf-8')
             except Exception as e:
-                return jsonify({'error': 'Invalid base64 content'}), 400
+                return jsonify({'error': f'Conversion failed: {str(e)}'}), 500
 
-            pdf_bytes = libreoffice_server.convert_to_pdf(filename, file_bytes)
-            pdf_base64 = base64.b64encode(pdf_bytes).decode('utf-8')
-
-            return jsonify({
-                'pdfcontent': pdf_base64
-            })
+            return jsonify({'pdfcontent': pdf_base64})
 
         @app.route('/heartbeat', methods=['GET'])
         def heartbeat():
@@ -59,7 +55,6 @@ def main():
                 return jsonify({'success': False, 'details': 'Server is stopped'}), 500
             else:
                 return jsonify({'success': True, 'details': 'Server is running'}), 200
-
 
         app.run(host=LISTEN_INTERFACE, port=LISTEN_PORT, debug=True, threaded=False, use_reloader=False)
 

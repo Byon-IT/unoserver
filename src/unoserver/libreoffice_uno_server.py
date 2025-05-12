@@ -212,7 +212,7 @@ class UnoServer:
         except:
             logger.exception("Conversion failed")
 
-    def convert_to_pdf(self, filename: str, file_content: bytes) -> bytes:
+    def convert_to_pdf(self, file_content: bytes) -> bytes:
         if not self.is_libreoffice_started:
             self.start()
 
