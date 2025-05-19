@@ -18,6 +18,7 @@ RUN pip3 install -r /tmp/requirements.txt
 RUN rm /tmp/requirements.txt
 
 COPY src/ /opt/libreoffice-converter/
+COPY ./pytest.ini /opt/libreoffice-converter/
 
 ARG CACHEBUST=1
 
