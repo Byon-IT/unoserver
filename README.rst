@@ -16,6 +16,6 @@ There are two endpoints:
 1. `http://<host>:<port>/convert-to-pdf`
 2. `http://<host>:<port>/heartbeat`
 
-For example usage, please view `tests/client.py`
+For example usage, please view `example/client.py`
 
 For possible environment configuration, please view the `.env.example` file.
