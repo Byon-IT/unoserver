@@ -22,4 +22,4 @@ COPY src/ /opt/libreoffice-converter/
 ARG CACHEBUST=1
 
 WORKDIR /opt/libreoffice-converter/
-CMD ["python3", "/opt/libreoffice-converter/rest_server.py"]
+CMD ["python3", "/opt/libreoffice-converter/main.py"]
