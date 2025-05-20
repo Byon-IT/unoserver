@@ -9,6 +9,8 @@ import base64
 TEST_FILES_DIR = Path(__file__).parent / "test_documents"
 
 
+# TODO: import CONVERSION_TIMEOUT and +10
+
 class BaseTestConvertToPDF:
     def setup_method(self):
         self.tmpdir = tempfile.TemporaryDirectory()
